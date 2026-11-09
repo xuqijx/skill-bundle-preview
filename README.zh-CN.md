@@ -2,7 +2,7 @@
 
 # skill-bundle-preview
 
-在分享或打包 Agent Skill 文件夹之前，先在本地做一次离线预检。它列出文件夹里的每个文件、相对路径、字节大小和合计；按文件名（basename）警告看起来像密钥的名字；如果 `SKILL.md` 或其他 Markdown 里的相对路径在文件夹内不存在，则报错。
+在分享或打包 Agent Skill 文件夹之前，先在本地做一次离线预检。它列出文件夹里的每个文件、相对路径、字节大小和合计；按文件名（basename）警告看起来像密钥的名字；如果根目录 `SKILL.md` 里的相对路径在文件夹内不存在，则报错。
 
 这些检查都是启发式规则。通过预检并不表示完成了恶意软件扫描，也不构成密钥扫描认证。命中排除名单的文件不会被打开，内容也不会被打印。工具不会上传文件夹。正常运行不使用网络。
 
@@ -36,15 +36,15 @@ python3 check.py
 | --- | --- |
 | 0 | 没有错误。可以有警告。 |
 | 1 | 有一个或多个错误。 |
-| 2 | 用法或 IO 问题，包括技能目录根下没有 `SKILL.md`。 |
+| 2 | 用法或 IO 问题，包括根目录没有 `SKILL.md`，或根目录 `SKILL.md` 是符号链接。 |
 
 ## 输出
 
 人类可读的报告有三节。
 
-- **inventory**：每个相对路径和字节大小，然后是 `total_bytes` 与 `file_count`。点文件会保留在清单里。大小来自 `lstat`。目录符号链接不会被跟进去。
+- **inventory**：每个相对路径和字节大小，然后是 `total_bytes` 与 `file_count`。点文件会保留在清单里。大小来自 `lstat`。目录符号链接不会被跟进去。只会打开根目录的 `SKILL.md`。
 - **warnings**：秘密式文件名。每一行包含命中的规则，以及 `contents not read`。
-- **errors**：缺失的相对引用（带 Markdown 文件和行号），或逃出技能目录的引用。加上 `--strict-secrets` 后，秘密式文件名改在这一节报出。
+- **errors**：根目录 `SKILL.md` 里缺失的相对引用（带行号），或逃出技能目录的引用。加上 `--strict-secrets` 后，秘密式文件名改在这一节报出。
 
 `--json` 打印一个 JSON 对象，字段有 `skill_dir`、`files`、`file_count`、`total_bytes`、`warnings`、`errors`、`strict_secrets`。
 
@@ -67,9 +67,9 @@ python3 check.py
 
 ## 相对引用（v0）
 
-检查器会读取 `SKILL.md` 以及技能目录下的其他 `*.md`。basename 命中排除名单的 Markdown 不会被读取，因此里面的引用也不会被抽出。
+只会打开根目录的 `SKILL.md`。其他文件，包括 `notes.md`、`references/notes.md` 这类 Markdown，只作为清单里的相对路径和 `lstat` 字节数。它们不会被打开、哈希或扫描引用。
 
-会保留这些写法：
+从根目录 `SKILL.md` 里会保留这些写法：
 
 - 行内链接和图片链接
 - 引用式定义，例如 `[notes]: references/notes.md`
@@ -77,9 +77,11 @@ python3 check.py
 
 反引号片段在这些情况下算路径：以 `./` 或 `../` 开头、包含 `/`，或是带常见扩展名的单个文件名（例如 `.md`、`.py`、`.json`、`.png`）。完整扩展名列表在 `skill_bundle_preview/refs.py`。围栏代码块会跳过。`http`、`https`、`mailto`、其他 scheme、协议相对 URL，以及只有片段标识的链接会跳过，也不会去获取。
 
-相对目标在技能目录内不存在，就是错误。用 `..` 离开技能目录，也是错误。消息里包含源文件、行号和失败的路径。
+相对目标在技能目录内不存在，就是错误。用 `..` 离开技能目录，也是错误。消息里包含 `SKILL.md`、行号和失败的路径。
 
 没有写成 Markdown 链接或反引号的普通文字路径不会检查。不校验 YAML frontmatter。
+
+根目录 `SKILL.md` 如果是符号链接，会拒绝并退出码 2，且不会打开它的目标。目录符号链接不会跟随。文件符号链接按 `lstat` 大小列入清单，不会被打开。秘密式 basename 也不会被打开。
 
 ## 示例夹具
 

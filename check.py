@@ -9,14 +9,18 @@ the promise that denylist files are not opened or printed.
 from __future__ import annotations
 
 import ast
+import builtins
 import json
 import os
-import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+from skill_bundle_preview.cli import inspect_skill
+from skill_bundle_preview.inventory import PreviewIOError
+from skill_bundle_preview.refs import markdown_files
 
 ROOT = Path(__file__).resolve().parent
 ENV = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -174,6 +178,12 @@ def test_usage_exit_2() -> None:
     help_proc = run(["--help"])
     check(help_proc.returncode == 0, f"--help exit {help_proc.returncode} (want 0)")
     check("--strict-secrets" in help_proc.stdout and "--json" in help_proc.stdout, "--help documents flags")
+    help_text = " ".join(help_proc.stdout.split())
+    check(
+        "Only the root SKILL.md is opened." in help_text,
+        "help says only the root SKILL.md is opened",
+        help_text,
+    )
 
 
 def test_secret_rules_and_edges() -> None:
@@ -270,6 +280,227 @@ def test_combined_strict_and_missing() -> None:
         check(len(strict_data["errors"]) == 2, "combined strict reports secret and missing ref")
 
 
+def _norm(path: str | Path) -> str:
+    return os.path.normpath(os.fspath(path))
+
+
+def _was_opened(opened: list[str], path: Path) -> bool:
+    wanted = _norm(path)
+    return any(_norm(item) == wanted for item in opened)
+
+
+class _OpenTrace:
+    """Record os.open and builtin open paths, including when the body raises."""
+
+    def __init__(self) -> None:
+        self.opened: list[str] = []
+        self._real_os_open = os.open
+        self._real_builtin_open = builtins.open
+
+    def __enter__(self) -> "_OpenTrace":
+        opened = self.opened
+        real_os_open = self._real_os_open
+        real_builtin_open = self._real_builtin_open
+
+        def traced_os_open(path, flags, *args, **kwargs):
+            if not isinstance(path, int):
+                opened.append(os.fsdecode(path))
+            return real_os_open(path, flags, *args, **kwargs)
+
+        def traced_builtin_open(file, *args, **kwargs):
+            if isinstance(file, (str, bytes, Path)):
+                opened.append(os.fsdecode(file))
+            return real_builtin_open(file, *args, **kwargs)
+
+        os.open = traced_os_open
+        builtins.open = traced_builtin_open
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        os.open = self._real_os_open
+        builtins.open = self._real_builtin_open
+        return False
+
+
+def _lock(path: Path) -> None:
+    os.chmod(path, 0)
+
+
+def _unlock(path: Path) -> None:
+    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+
+
+def _assert_marker_unread(proc: subprocess.CompletedProcess[str], marker: str, label: str) -> None:
+    combined = proc.stdout + proc.stderr
+    check(marker not in combined, f"{label} marker is absent from output", combined)
+    check("Permission denied" not in combined, f"{label} did not fail by reading an unreadable target", combined)
+
+
+def test_root_skill_md_only_and_symlinks() -> None:
+    """Other markdown is listed, not opened. Symlink targets are not read."""
+    selected = markdown_files(
+        ["SKILL.md", "notes.md", "references/notes.md", "references/SKILL.md"]
+    )
+    check(selected == ["SKILL.md"], "markdown_files selects only the root SKILL.md", str(selected))
+    check(
+        markdown_files(["notes.md", "references/notes.md"]) == [],
+        "markdown_files ignores markdown other than the root SKILL.md",
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        skill = Path(tmp) / "skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            "# Fictional skill\n\nSee [notes](notes.md).\n",
+            encoding="utf-8",
+        )
+        notes = skill / "notes.md"
+        notes_marker = "UNIQUE_NOTES_BODY_7f3a"
+        notes.write_text(
+            f"{notes_marker}\nSee [gone](missing-from-notes-7f3a.md).\n",
+            encoding="utf-8",
+        )
+        _lock(notes)
+        try:
+            proc = run([str(skill), "--json"])
+            with _OpenTrace() as trace:
+                result = inspect_skill(skill)
+            opened = trace.opened
+        finally:
+            _unlock(notes)
+        check(proc.returncode == 0, f"unreadable notes.md exit {proc.returncode} (want 0)", proc.stdout + proc.stderr)
+        _assert_marker_unread(proc, notes_marker, "notes.md")
+        check("missing-from-notes-7f3a.md" not in proc.stdout + proc.stderr, "notes.md refs are not scanned", proc.stdout)
+        check(not _was_opened(opened, notes), "notes.md path was not opened", "\n".join(opened))
+        check(_was_opened(opened, skill / "SKILL.md"), "root SKILL.md was opened", "\n".join(opened))
+        listed = [item.path for item in result[0]]
+        check("notes.md" in listed and "SKILL.md" in listed, "unread notes.md stays in the inventory", str(listed))
+        check(result[2] == [], "root SKILL.md refs resolve without reading notes.md")
+
+    probe: Path | None = None
+    try:
+        probe = Path(tempfile.mkdtemp())
+        os.symlink(probe / "target", probe / "link")
+    except (OSError, NotImplementedError) as err:
+        check(False, f"symlink fixtures are not supported here: {err}")
+        return
+    finally:
+        if probe is not None and probe.exists():
+            import shutil
+            shutil.rmtree(probe, ignore_errors=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        skill = root / "skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("# Fictional skill\n\nNo local refs.\n", encoding="utf-8")
+        outside = root / "outside-notes.md"
+        md_marker = "UNIQUE_MD_LINK_BODY_7f3a"
+        outside.write_text(
+            f"{md_marker}\nSee [gone](missing-via-md-symlink-7f3a.md).\n" + ("x" * 64),
+            encoding="utf-8",
+        )
+        link = skill / "notes.md"
+        os.symlink(outside, link)
+        _lock(outside)
+        try:
+            proc = run([str(skill), "--json"])
+            with _OpenTrace() as trace:
+                result = inspect_skill(skill)
+            opened = trace.opened
+        finally:
+            _unlock(outside)
+        check(proc.returncode == 0, f"md symlink exit {proc.returncode} (want 0)", proc.stdout + proc.stderr)
+        _assert_marker_unread(proc, md_marker, "md symlink")
+        check(
+            "missing-via-md-symlink-7f3a.md" not in proc.stdout + proc.stderr,
+            "md symlink target was not scanned",
+            proc.stdout,
+        )
+        check(not _was_opened(opened, outside), "md symlink target path was not opened", "\n".join(opened))
+        check(not _was_opened(opened, link), "md symlink path was not opened", "\n".join(opened))
+        check(_was_opened(opened, skill / "SKILL.md"), "regular root SKILL.md still opens beside an md symlink")
+        data = json.loads(proc.stdout)
+        listed = {item["path"]: item["bytes"] for item in data["files"]}
+        check("notes.md" in listed, "md symlink is listed in the inventory")
+        check(
+            listed["notes.md"] == link.lstat().st_size,
+            "md symlink byte size is the lstat size",
+            str(listed),
+        )
+        check(
+            listed["notes.md"] != outside.stat().st_size,
+            "md symlink size is not the outside target size",
+        )
+        check(result[2] == [], "md symlink does not add ref errors")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        skill = root / "skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("# Fictional skill\n\nNo local refs.\n", encoding="utf-8")
+        outside_dir = root / "outside-dir"
+        outside_dir.mkdir()
+        marker_file = outside_dir / "secret.md"
+        dir_marker = "UNIQUE_DIR_LINK_BODY_7f3a"
+        marker_file.write_text(
+            f"{dir_marker}\nSee [gone](missing-via-dir-symlink-7f3a.md).\n",
+            encoding="utf-8",
+        )
+        os.symlink(outside_dir, skill / "ext", target_is_directory=True)
+        _lock(marker_file)
+        try:
+            proc = run([str(skill), "--json"])
+            with _OpenTrace() as trace:
+                inspect_skill(skill)
+            opened = trace.opened
+        finally:
+            _unlock(marker_file)
+        check(proc.returncode == 0, f"directory symlink exit {proc.returncode} (want 0)", proc.stdout + proc.stderr)
+        _assert_marker_unread(proc, dir_marker, "directory symlink")
+        combined = proc.stdout + proc.stderr
+        check("ext/secret.md" not in combined, "directory symlink is not expanded in the inventory", combined)
+        check("missing-via-dir-symlink-7f3a.md" not in combined, "directory symlink target was not scanned", combined)
+        check(not _was_opened(opened, marker_file), "directory symlink target file was not opened", "\n".join(opened))
+        check(not _was_opened(opened, outside_dir), "outside directory was not opened", "\n".join(opened))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        skill = root / "skill"
+        skill.mkdir()
+        outside_skill = root / "outside-skill.md"
+        skill_marker = "UNIQUE_SKILL_LINK_BODY_7f3a"
+        outside_skill.write_text(
+            f"{skill_marker}\nSee [gone](missing-via-skill-symlink-7f3a.md).\n",
+            encoding="utf-8",
+        )
+        os.symlink(outside_skill, skill / "SKILL.md")
+        _lock(outside_skill)
+        raised = ""
+        opened: list[str] = []
+        try:
+            proc = run([str(skill)])
+            with _OpenTrace() as trace:
+                try:
+                    inspect_skill(skill)
+                except PreviewIOError as err:
+                    raised = str(err)
+            opened = trace.opened
+        finally:
+            _unlock(outside_skill)
+        check(proc.returncode == 2, f"symlink SKILL.md exit {proc.returncode} (want 2)", proc.stdout + proc.stderr)
+        _assert_marker_unread(proc, skill_marker, "symlink SKILL.md")
+        check("symlink" in proc.stderr, "symlink SKILL.md error names the symlink", proc.stderr)
+        check(
+            "missing-via-skill-symlink-7f3a.md" not in proc.stdout + proc.stderr,
+            "symlink SKILL.md target was not scanned",
+            proc.stdout + proc.stderr,
+        )
+        check("symlink" in raised, "inspect_skill rejects a symlink root SKILL.md", raised)
+        check(not _was_opened(opened, outside_skill), "symlink SKILL.md target was not opened", "\n".join(opened))
+        check(not _was_opened(opened, skill / "SKILL.md"), "symlink SKILL.md path was not opened", "\n".join(opened))
+
+
 def test_package_has_no_network_imports() -> None:
     banned = {
         "socket",
@@ -283,6 +514,7 @@ def test_package_has_no_network_imports() -> None:
         "webbrowser",
         "xmlrpc",
         "subprocess",
+        "hashlib",
     }
     package = ROOT / "skill_bundle_preview"
     found: set[str] = set()
@@ -295,7 +527,7 @@ def test_package_has_no_network_imports() -> None:
             elif isinstance(node, ast.ImportFrom) and node.module:
                 found.add(node.module.split(".", 1)[0])
     used = sorted(found & banned)
-    check(not used, "package does not import network or subprocess modules", ", ".join(used))
+    check(not used, "package does not import network, subprocess, or hashlib", ", ".join(used))
 
 
 def main() -> int:
@@ -306,6 +538,7 @@ def main() -> int:
     test_usage_exit_2()
     test_secret_rules_and_edges()
     test_combined_strict_and_missing()
+    test_root_skill_md_only_and_symlinks()
     test_package_has_no_network_imports()
     after = snapshot_fixtures()
     check(before == after, "fixture files are not modified or deleted")

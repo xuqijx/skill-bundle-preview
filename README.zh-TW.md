@@ -2,7 +2,7 @@
 
 # skill-bundle-preview
 
-在分享或打包 Agent Skill 資料夾之前，先在本機做一次離線預檢。它列出資料夾裡的每個檔案、相對路徑、位元組大小與合計；依檔名（basename）警告看起來像密鑰的名字；如果 `SKILL.md` 或其他 Markdown 裡的相對路徑在資料夾內不存在，就報錯。
+在分享或打包 Agent Skill 資料夾之前，先在本機做一次離線預檢。它列出資料夾裡的每個檔案、相對路徑、位元組大小與合計；依檔名（basename）警告看起來像密鑰的名字；如果根目錄 `SKILL.md` 裡的相對路徑在資料夾內不存在，就報錯。
 
 這些檢查都是啟發式規則。通過預檢並不表示完成了惡意軟體掃描，也不構成密鑰掃描認證。命中排除名單的檔案不會被開啟，內容也不會被印出。工具不會上傳資料夾。正常執行不使用網路。
 
@@ -36,15 +36,15 @@ python3 check.py
 | --- | --- |
 | 0 | 沒有錯誤。可以有警告。 |
 | 1 | 有一個或多個錯誤。 |
-| 2 | 用法或 IO 問題，包括技能目錄根目錄沒有 `SKILL.md`。 |
+| 2 | 用法或 IO 問題，包括根目錄沒有 `SKILL.md`，或根目錄 `SKILL.md` 是符號連結。 |
 
 ## 輸出
 
 給人讀的報告有三節。
 
-- **inventory**：每個相對路徑和位元組大小，接著是 `total_bytes` 與 `file_count`。點檔會留在清單裡。大小來自 `lstat`。目錄符號連結不會被跟著走下去。
+- **inventory**：每個相對路徑和位元組大小，接著是 `total_bytes` 與 `file_count`。點檔會留在清單裡。大小來自 `lstat`。目錄符號連結不會被跟著走下去。只會開啟根目錄的 `SKILL.md`。
 - **warnings**：秘密式檔名。每一行列出命中的規則，以及 `contents not read`。
-- **errors**：缺少的相對參照（含 Markdown 檔與行號），或逃出技能目錄的參照。加上 `--strict-secrets` 後，秘密式檔名改在這一節報出。
+- **errors**：根目錄 `SKILL.md` 裡缺少的相對參照（含行號），或逃出技能目錄的參照。加上 `--strict-secrets` 後，秘密式檔名改在這一節報出。
 
 `--json` 印出一個 JSON 物件，欄位有 `skill_dir`、`files`、`file_count`、`total_bytes`、`warnings`、`errors`、`strict_secrets`。
 
@@ -67,9 +67,9 @@ python3 check.py
 
 ## 相對參照（v0）
 
-檢查器會讀取 `SKILL.md` 以及技能目錄下的其他 `*.md`。basename 命中排除名單的 Markdown 不會被讀取，因此裡面的參照也不會被抽出。
+只會開啟根目錄的 `SKILL.md`。其他檔案，包括 `notes.md`、`references/notes.md` 這類 Markdown，只作為清單裡的相對路徑和 `lstat` 位元組數。它們不會被開啟、雜湊或掃描參照。
 
-會保留這些寫法：
+從根目錄 `SKILL.md` 裡會保留這些寫法：
 
 - 行內連結與圖片連結
 - 參照式定義，例如 `[notes]: references/notes.md`
@@ -77,9 +77,11 @@ python3 check.py
 
 反引號片段在這些情況下算路徑：以 `./` 或 `../` 開頭、包含 `/`，或是帶常見副檔名的單檔名（例如 `.md`、`.py`、`.json`、`.png`）。完整副檔名清單在 `skill_bundle_preview/refs.py`。圍欄程式碼區塊會跳過。`http`、`https`、`mailto`、其他 scheme、協定相對 URL，以及只有片段識別的連結會跳過，也不會去抓取。
 
-相對目標在技能目錄內不存在，就是錯誤。用 `..` 離開技能目錄，也是錯誤。訊息裡包含來源檔、行號和失敗的路徑。
+相對目標在技能目錄內不存在，就是錯誤。用 `..` 離開技能目錄，也是錯誤。訊息裡包含 `SKILL.md`、行號和失敗的路徑。
 
 沒有寫成 Markdown 連結或反引號的普通文字路徑不會檢查。不驗證 YAML frontmatter。
+
+根目錄 `SKILL.md` 如果是符號連結，會拒絕並以結束狀態 2 退出，且不會開啟它的目標。目錄符號連結不會跟隨。檔案符號連結按 `lstat` 大小列入清單，不會被開啟。秘密式 basename 也不會被開啟。
 
 ## 範例夾具
 

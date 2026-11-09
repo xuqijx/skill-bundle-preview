@@ -1,14 +1,18 @@
-"""Heuristic relative-path checks for skill markdown.
+"""Heuristic relative-path checks for the root SKILL.md.
 
-Reads SKILL.md and other ``*.md`` files. Extracts inline links, image links,
-reference definitions, and backtick spans that look like relative paths.
-External URLs are ignored. Fenced code blocks are ignored. Secret-like
-filenames are never opened.
+Only ``<skill-dir>/SKILL.md`` is opened. Other markdown files are not opened,
+hashed, or scanned. Extracts inline links, image links, reference definitions,
+and backtick spans that look like relative paths. External URLs are ignored.
+Fenced code blocks are ignored. Secret-like filenames are never opened.
+Symlinks are not followed.
 """
 
 from __future__ import annotations
 
+import errno
+import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,23 +42,23 @@ class RefError:
     message: str
 
 
-def markdown_files(root: Path, relative_paths: list[str]) -> list[str]:
-    """``*.md`` paths whose basenames are safe to open."""
-    chosen: list[str] = []
-    for relative in relative_paths:
-        name = relative.rsplit("/", 1)[-1]
-        if not name.endswith(".md"):
-            continue
-        if matching_secret_rule(name):
-            continue
-        chosen.append(relative)
-    return chosen
+def markdown_files(relative_paths: list[str]) -> list[str]:
+    """Return markdown paths whose contents may be read.
+
+    The only selectable path is the skill-root ``SKILL.md``. Nested files such
+    as ``notes.md`` and ``references/notes.md`` stay unread even if the
+    inventory lists them.
+    """
+    if "SKILL.md" in relative_paths:
+        return ["SKILL.md"]
+    return []
 
 
-def find_ref_errors(root: Path, relative_paths: list[str]) -> list[RefError]:
+def find_ref_errors(root: Path) -> list[RefError]:
+    """Check relative refs in the root SKILL.md and nowhere else."""
     errors: list[RefError] = []
     seen: set[tuple[str, int, str, str]] = set()
-    for relative in markdown_files(root, relative_paths):
+    for relative in markdown_files(["SKILL.md"]):
         text = _read_markdown(root / relative)
         for line_no, ref in _iter_refs(text):
             located = _locate(root, root / relative, ref)
@@ -62,7 +66,7 @@ def find_ref_errors(root: Path, relative_paths: list[str]) -> list[RefError]:
                 continue
             target, problem = located
             if problem is None:
-                if target is not None and (target.is_file() or target.is_dir()):
+                if target is not None and _unfollowed_exists(root, target):
                     continue
                 problem = "missing"
             if problem == "missing":
@@ -82,14 +86,68 @@ def find_ref_errors(root: Path, relative_paths: list[str]) -> list[RefError]:
 
 
 def _read_markdown(path: Path) -> str:
-    # Basename gate is applied again so a future caller cannot open a denylist file.
+    """Open a regular root SKILL.md. Never follow a symlink or read any other file."""
+    if path.name != "SKILL.md":
+        raise PreviewIOError(
+            f"refusing to read {path.name}; only the root SKILL.md is opened"
+        )
     if matching_secret_rule(path.name):
         raise PreviewIOError(f"refused to open secret-like filename: {path.name}")
     try:
-        with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
+        info = path.lstat()
+    except OSError as err:
+        raise PreviewIOError(f"cannot read markdown {path}: {err.strerror}") from err
+    if stat.S_ISLNK(info.st_mode):
+        raise PreviewIOError(f"refusing to follow symlink SKILL.md: {path}")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as err:
+        if err.errno == errno.ELOOP:
+            raise PreviewIOError(f"refusing to follow symlink SKILL.md: {path}") from err
+        raise PreviewIOError(f"cannot read markdown {path}: {err.strerror}") from err
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8-sig", errors="replace") as handle:
             return handle.read()
     except OSError as err:
         raise PreviewIOError(f"cannot read markdown {path}: {err.strerror}") from err
+
+
+def _unfollowed_exists(root: Path, target: Path) -> bool:
+    """True when every path component inside ``root`` exists via lstat.
+
+    Intermediate symlinks are not traversed, so a directory symlink cannot
+    pull existence checks outside the skill directory. A final symlink counts
+    as an existing directory entry and is not opened.
+    """
+    try:
+        relative = target.relative_to(root)
+    except ValueError:
+        return False
+    current = root
+    parts = relative.parts
+    if not parts:
+        try:
+            mode = root.lstat().st_mode
+        except OSError:
+            return False
+        return stat.S_ISDIR(mode) and not stat.S_ISLNK(mode)
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            mode = current.lstat().st_mode
+        except OSError:
+            return False
+        last = index == len(parts) - 1
+        if stat.S_ISLNK(mode):
+            return last
+        if last:
+            return stat.S_ISREG(mode) or stat.S_ISDIR(mode)
+        if not stat.S_ISDIR(mode):
+            return False
+    return False
 
 
 def _iter_refs(text: str) -> list[tuple[int, str]]:

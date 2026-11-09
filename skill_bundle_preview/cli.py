@@ -27,9 +27,10 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python3 -m skill_bundle_preview",
         description=(
             "Offline dry-run before sharing or zipping an Agent Skill folder. "
-            "Lists every file with its size, warns on secret-like filenames "
-            "without reading them, and reports relative markdown refs that "
-            "are missing inside the skill directory."
+            "Lists every file with its lstat size, warns on secret-like filenames "
+            "without reading them, and reports relative refs from the root "
+            "SKILL.md that are missing inside the skill directory. "
+            "Only the root SKILL.md is opened."
         ),
     )
     parser.add_argument(
@@ -55,6 +56,11 @@ def inspect_skill(root: Path) -> tuple[list[FileEntry], list[SecretHit], list[Re
     if not root.is_dir():
         raise PreviewIOError(f"skill path is not a directory: {root}")
     skill_md = root / "SKILL.md"
+    # lstat, not stat: a symlink root SKILL.md is rejected before any open.
+    if skill_md.is_symlink():
+        raise PreviewIOError(
+            f"refusing to follow symlink SKILL.md at the skill root: {root}"
+        )
     if not skill_md.is_file():
         raise PreviewIOError(
             f"SKILL.md is required at the root of the skill directory: {root}"
@@ -67,7 +73,7 @@ def inspect_skill(root: Path) -> tuple[list[FileEntry], list[SecretHit], list[Re
         rule = matching_secret_rule(basename)
         if rule is not None:
             secrets.append(SecretHit(entry.path, rule))
-    ref_errors = find_ref_errors(root, [entry.path for entry in files])
+    ref_errors = find_ref_errors(root)
     return files, secrets, ref_errors
 
 

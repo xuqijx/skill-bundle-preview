@@ -2,7 +2,7 @@
 
 # skill-bundle-preview
 
-Offline CLI dry-run before you share or zip an Agent Skill folder. It lists every file in the folder, with the relative path, the size in bytes, and a total. It warns when a basename looks secret-like. It errors when `SKILL.md`, or any other markdown file, points at a relative path that is missing inside the folder.
+Offline CLI dry-run before you share or zip an Agent Skill folder. It lists every file in the folder, with the relative path, the size in bytes, and a total. It warns when a basename looks secret-like. It errors when the root `SKILL.md` points at a relative path that is missing inside the folder.
 
 The checks are heuristics. A clean run is not a malware scan and not a secret-scan certification. Files whose names match the denylist are not opened, and their contents are never printed. Nothing is uploaded. A normal run does not use the network.
 
@@ -36,15 +36,15 @@ python3 check.py
 | --- | --- |
 | 0 | No errors. Warnings are allowed. |
 | 1 | One or more errors. |
-| 2 | Usage or IO problem, including a skill directory with no root `SKILL.md`. |
+| 2 | Usage or IO problem, including a missing root `SKILL.md` or a root `SKILL.md` that is a symlink. |
 
 ## What it prints
 
 Human output has three sections.
 
-- **inventory** lists each relative path and its size in bytes, then `total_bytes` and `file_count`. Dotfiles stay in the list. Sizes come from `lstat`. Directory symlinks are not followed.
+- **inventory** lists each relative path and its size in bytes, then `total_bytes` and `file_count`. Dotfiles stay in the list. Sizes come from `lstat`. Directory symlinks are not followed. Only the root `SKILL.md` is opened.
 - **warnings** name secret-like basenames. Each line includes the matched rule and the words `contents not read`.
-- **errors** name a missing relative ref, with the markdown file and line, or a ref that escapes the skill directory. With `--strict-secrets`, secret-like filenames are reported in this section instead.
+- **errors** name a missing relative ref from the root `SKILL.md`, with the line, or a ref that escapes the skill directory. With `--strict-secrets`, secret-like filenames are reported in this section instead.
 
 `--json` prints one JSON object with `skill_dir`, `files`, `file_count`, `total_bytes`, `warnings`, `errors`, and `strict_secrets`.
 
@@ -67,9 +67,9 @@ Matching uses the basename only. It is case-sensitive. The first matching rule w
 
 ## Relative refs (v0)
 
-The checker reads `SKILL.md` and every other `*.md` file under the skill directory. A markdown file whose basename matches the denylist is left unread, so refs inside that file are not extracted.
+Only the root `SKILL.md` is opened. Other files, including other markdown such as `notes.md` and `references/notes.md`, are inventory rows: a relative path and an `lstat` size. They are not opened, hashed, or scanned for refs.
 
-From the text it keeps:
+From the root `SKILL.md` the checker keeps:
 
 - inline links and image links
 - reference definitions such as `[notes]: references/notes.md`
@@ -77,9 +77,11 @@ From the text it keeps:
 
 A backtick span counts when it starts with `./` or `../`, contains `/`, or is a single filename with a common extension such as `.md`, `.py`, `.json`, or `.png`. The extension list lives in `skill_bundle_preview/refs.py`. Fenced code blocks are skipped. `http`, `https`, `mailto`, other schemes, protocol-relative URLs, and fragment-only links are skipped. They are not fetched.
 
-A relative target that is missing inside the skill directory is an error. A target that would leave the directory through `..` is an error. The message includes the source file, the line number, and the path that failed.
+A relative target that is missing inside the skill directory is an error. A target that would leave the directory through `..` is an error. The message includes `SKILL.md`, the line number, and the path that failed.
 
 Paths written as ordinary prose, with no markdown link and no backticks, are left alone. YAML frontmatter is not validated.
+
+A root `SKILL.md` that is a symlink is rejected (exit 2) and its target is not opened. Directory symlinks are not followed. File symlinks are listed with their `lstat` size and are not opened. Secret-like basenames are not opened either.
 
 ## Fixtures
 
